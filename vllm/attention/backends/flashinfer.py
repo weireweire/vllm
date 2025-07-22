@@ -125,12 +125,8 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def use_trtllm_decode_attention(
-        batch_size: int,
-        max_seq_len: int,
+        attn_metadata: "FlashInferMetadata",
         kv_cache_dtype: str,
-        num_qo_heads: Optional[int],
-        num_kv_heads: Optional[int],
-        attn_head_size: Optional[int],
     ) -> bool:
         if FlashInferBackend.cached_sm100a_supported is None:
             FlashInferBackend.cached_sm100a_supported = (
@@ -138,9 +134,9 @@ class FlashInferBackend(AttentionBackend):
         if not FlashInferBackend.cached_sm100a_supported:
             return False
         # Check if the dimensions are supported by TRTLLM decode attention
-        if (attn_head_size is None or num_qo_heads is None
-                or num_kv_heads is None or num_qo_heads // num_kv_heads > 8
-                or num_qo_heads % num_kv_heads != 0 or attn_head_size != 128):
+        if (attn_metadata.head_dim is None or attn_metadata.num_qo_heads is None
+                or attn_metadata.num_kv_heads is None or attn_metadata.num_qo_heads // attn_metadata.num_kv_heads > 8
+                or attn_metadata.num_qo_heads % attn_metadata.num_kv_heads != 0 or attn_metadata.head_dim != 128):
             return False
         env_value = envs.VLLM_USE_TRTLLM_DECODE_ATTENTION
         if env_value is not None:
@@ -157,7 +153,7 @@ class FlashInferBackend(AttentionBackend):
         else:
             # Environment variable not set - use auto-detection
             use_trtllm = (FlashInferBackend.cached_sm100a_supported
-                          and batch_size <= 256 and max_seq_len < 131072
+                          and attn_metadata.num_decode_tokens <= 256 and attn_metadata.max_decode_seq_len < 131072
                           and kv_cache_dtype == "auto")
             if use_trtllm:
                 logger.warning_once(
@@ -272,8 +268,10 @@ class FlashInferState(AttentionState):
                 self._get_workspace_buffer(), self.get_kv_cache_layout())
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self):
+    def _get_decode_wrapper(self, backend: str):
         if self._decode_wrapper is None:
+            if backend == "trtllm-gen":
+                assert self.get_kv_cache_layout() == "HND"
             num_qo_heads = (self.runner.model_config.get_num_attention_heads(
                 self.runner.parallel_config))
             num_kv_heads = self.runner.model_config.get_num_kv_heads(
@@ -283,7 +281,8 @@ class FlashInferState(AttentionState):
             self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 self.get_kv_cache_layout(),
-                use_tensor_cores=use_tensor_cores)
+                use_tensor_cores=use_tensor_cores,
+                backend=backend)
         return self._decode_wrapper
 
     @contextmanager
@@ -443,7 +442,9 @@ class FlashInferState(AttentionState):
 
         model_input.attn_metadata.prefill_wrapper = state._get_prefill_wrapper(
         )
-        model_input.attn_metadata.decode_wrapper = state._get_decode_wrapper()
+        use_trtllm = FlashInferBackend.use_trtllm_decode_attention(
+                    model_input.attn_metadata, self.runner.kv_cache_dtype)
+        model_input.attn_metadata.decode_wrapper = state._get_decode_wrapper(backend="trtllm-gen" if use_trtllm else "auto")
         model_input.attn_metadata.begin_forward()
 
 
@@ -1151,34 +1152,12 @@ class FlashInferImpl(AttentionImpl):
             assert decode_meta.decode_wrapper._sm_scale == softmax_scale
             # TODO: @pavanimajety Remove this once the switch happens
             # inside flashinfer.
-            if not FlashInferBackend.use_trtllm_decode_attention(
-                    num_decode_tokens, attn_metadata.max_decode_seq_len,
-                    kv_cache_dtype, attn_metadata.num_qo_heads,
-                    attn_metadata.num_kv_heads, attn_metadata.head_dim):
-                decode_output = decode_meta.decode_wrapper.run(
-                    decode_query,
-                    kv_cache.permute(*stride_order),
-                    k_scale=layer._k_scale_float,
-                    v_scale=layer._v_scale_float,
-                )
-            else:
-                workspace_buffer = (
-                    decode_meta.decode_wrapper._int_workspace_buffer)
-                assert FlashInferState.get_kv_cache_layout() == "HND"
-                decode_output = trtllm_batch_decode_with_kv_cache(
-                    query=decode_query,
-                    kv_cache=kv_cache.permute(*stride_order),
-                    workspace_buffer=workspace_buffer,
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    scale=softmax_scale,
-                    block_tables=attn_metadata.block_tables,
-                    seq_lens=decode_meta.seq_lens_tensor,
-                    block_size=attn_metadata.page_size,
-                    max_seq_len=attn_metadata.max_decode_seq_len,
-                    kv_cache_dtype=kv_cache_dtype,
-                    k_scale=layer._k_scale_float,
-                    v_scale=layer._v_scale_float)
+            decode_output = decode_meta.decode_wrapper.run(
+                decode_query,
+                kv_cache.permute(*stride_order),
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+            )
 
         if prefill_output is None and decode_output is not None:
             # Decode only batch.

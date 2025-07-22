@@ -253,13 +253,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 device=self.device)
         return self._workspace_buffer
 
-    def _get_prefill_wrapper(self):
+    def _get_prefill_wrapper(self, backend: str = "auto"):
         if self._prefill_wrapper is None:
             self._prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self._get_workspace_buffer(), get_kv_cache_layout())
+                self._get_workspace_buffer(), get_kv_cache_layout(), backend=backend)
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self):
+    def _get_decode_wrapper(self, backend: str = "auto"):
         if self._decode_wrapper is None:
             num_qo_heads = (
                 self.vllm_config.model_config.get_num_attention_heads(
@@ -271,7 +271,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 get_kv_cache_layout(),
-                use_tensor_cores=use_tensor_cores)
+                use_tensor_cores=use_tensor_cores,
+                backend=backend)
         return self._decode_wrapper
 
     def _get_cascade_wrapper(self):
@@ -350,28 +351,29 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
 
             if num_decodes > 0:
-                attn_metadata.decode_wrapper = self._get_decode_wrapper()
-                if not FlashInferBackend.use_trtllm_decode_attention(
-                        num_decodes, attn_metadata.max_seq_len,
-                        self.cache_config.cache_dtype,
-                        attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
-                        attn_metadata.head_dim):
-                    attn_metadata.decode_wrapper.plan(
-                        attn_metadata.paged_kv_indptr[:num_decodes + 1],
-                        attn_metadata.paged_kv_indices,
-                        attn_metadata.paged_kv_last_page_len[:num_decodes],
-                        attn_metadata.num_qo_heads,
-                        attn_metadata.num_kv_heads,
-                        attn_metadata.head_dim,
-                        attn_metadata.page_size,
-                        # Disable flashinfer's pos encoding and use vllm's rope.
-                        pos_encoding_mode="NONE",
-                        sm_scale=self.global_hyperparameters.sm_scale,
-                        window_left=self.global_hyperparameters.window_left,
-                        logits_soft_cap=self.global_hyperparameters.
-                        logits_soft_cap,
-                        q_data_type=attn_metadata.q_data_type,
-                        kv_data_type=attn_metadata.kv_data_type,
+                use_trtllm = FlashInferBackend.use_trtllm_decode_attention(
+                    num_decodes, attn_metadata.max_seq_len,
+                    self.cache_config.cache_dtype,
+                    attn_metadata.num_qo_heads, attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim)
+
+                attn_metadata.decode_wrapper = self._get_decode_wrapper("trtllm-gen" if use_trtllm else "auto")
+                attn_metadata.decode_wrapper.plan(
+                    attn_metadata.paged_kv_indptr[:num_decodes + 1],
+                    attn_metadata.paged_kv_indices,
+                    attn_metadata.paged_kv_last_page_len[:num_decodes],
+                    attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim,
+                    attn_metadata.page_size,
+                    # Disable flashinfer's pos encoding and use vllm's rope.
+                    pos_encoding_mode="NONE",
+                    sm_scale=self.global_hyperparameters.sm_scale,
+                    window_left=self.global_hyperparameters.window_left,
+                    logits_soft_cap=self.global_hyperparameters.
+                    logits_soft_cap,
+                    q_data_type=attn_metadata.q_data_type,
+                    kv_data_type=attn_metadata.kv_data_type,
                     )
 
     def build(self,
@@ -632,52 +634,16 @@ class FlashInferImpl(AttentionImpl):
         if decode_wrapper := attn_metadata.decode_wrapper:
             decode_query = query[:num_decode_tokens]
             assert decode_query.shape[0] == num_decode_tokens
-            if not FlashInferBackend.use_trtllm_decode_attention(
-                    attn_metadata.num_decodes, attn_metadata.max_seq_len,
-                    self.kv_cache_dtype, attn_metadata.num_qo_heads,
-                    attn_metadata.num_kv_heads, attn_metadata.head_dim):
-                assert decode_wrapper is not None
-                assert decode_wrapper._window_left == window_left
-                assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap
-                                                           or 0.0)
-                assert decode_wrapper._sm_scale == self.scale
-                decode_wrapper.run(
-                    decode_query,
-                    kv_cache_permute,
-                    k_scale=layer._k_scale_float,
-                    v_scale=layer._v_scale_float,
-                    out=output[:num_decode_tokens],
-                )
-            else:
-                # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
-                if num_decode_tokens > 0:
-                    # decode_query may be non-contiguous
-                    decode_query = decode_query.contiguous()
-                    block_tables_decode = attn_metadata.block_table_tensor[:
-                                                                           num_decode_tokens]
-                    seq_lens_decode = attn_metadata.seq_lens[:
-                                                             num_decode_tokens]
-
-                    assert get_kv_cache_layout() == "HND"
-                    assert decode_query.is_contiguous()
-                    assert kv_cache_permute.is_contiguous()
-                    assert block_tables_decode.is_contiguous()
-                    assert seq_lens_decode.is_contiguous()
-
-                    output[:num_decode_tokens] = (
-                        trtllm_batch_decode_with_kv_cache(
-                            query=decode_query,
-                            kv_cache=kv_cache_permute,
-                            workspace_buffer=attn_metadata.workspace_buffer,
-                            num_heads=self.num_heads,
-                            num_kv_heads=self.num_kv_heads,
-                            scale=self.scale,
-                            block_tables=block_tables_decode,
-                            seq_lens=seq_lens_decode,
-                            block_size=attn_metadata.page_size,
-                            max_seq_len=attn_metadata.max_seq_len,
-                            kv_cache_dtype=self.kv_cache_dtype,
-                            k_scale=layer._k_scale_float,
-                            v_scale=layer._v_scale_float,
-                        ))
+            assert decode_wrapper is not None
+            assert decode_wrapper._window_left == window_left
+            assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap
+                                                        or 0.0)
+            assert decode_wrapper._sm_scale == self.scale
+            decode_wrapper.run(
+                decode_query,
+                kv_cache_permute,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                out=output[:num_decode_tokens],
+            )
         return output_padded

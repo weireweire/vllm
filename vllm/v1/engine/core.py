@@ -1044,7 +1044,7 @@ class DPEngineCoreProc(EngineCoreProc):
         while True:
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
-
+            self.scheduler.sync_queued_requests(self.dp_group)
             # 2) Step the engine core.
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()

@@ -177,6 +177,7 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self.global_min_queued = 0
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -664,6 +665,7 @@ class Scheduler(SchedulerInterface):
             max_num_delayed_tokens.
         - Any request in the queued queue has been delayed more than
             the max_delayed_iterations.
+        - All data parallel ranks have requests in their queued queues.
         """
         tokens_exceeded = lambda: sum(
             request.num_tokens for request in self.queued
@@ -674,11 +676,17 @@ class Scheduler(SchedulerInterface):
             max_delayed_iterations for request in self.queued)
 
         graduate = len(self.running) == 0 or tokens_exceeded() or \
-            iterations_exceeded()
+            iterations_exceeded() or \
+            self.global_min_queued >= \
+                self.scheduler_config.min_concurrent_requests
 
         if graduate:
             self.waiting.extend(self.queued)  # type: ignore
             self.queued.clear()  # type: ignore
+
+    def sync_queued_requests(self, dp_group):
+        self.global_min_queued = self.parallel_config.all_has_prefill_request(
+            dp_group, len(self.queued))
 
     def _update_after_schedule(
         self,

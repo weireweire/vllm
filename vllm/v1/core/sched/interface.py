@@ -123,6 +123,11 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def sync_queued_requests(self, dp_group):
+        """Sync the queued requests across data parallel ranks."""
+        raise NotImplementedError
+
     def has_requests(self) -> bool:
         """Returns True if there are unfinished requests, or finished requests
         not yet returned in SchedulerOutputs."""

@@ -457,7 +457,7 @@ class EngineArgs:
     async_scheduling: bool = SchedulerConfig.async_scheduling
     max_delayed_iterations: int = SchedulerConfig.max_delayed_iterations
     max_num_delayed_tokens: int = SchedulerConfig.max_num_delayed_tokens
-
+    min_concurrent_requests: int = SchedulerConfig.min_concurrent_requests
     kv_sharing_fast_prefill: bool = \
         CacheConfig.kv_sharing_fast_prefill
 
@@ -883,6 +883,9 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--max-num-delayed-tokens",
             **scheduler_kwargs["max_num_delayed_tokens"])
+        scheduler_group.add_argument(
+            "--min-concurrent-requests",
+            **scheduler_kwargs["min_concurrent_requests"])
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1353,6 +1356,7 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             max_delayed_iterations=self.max_delayed_iterations,
             max_num_delayed_tokens=self.max_num_delayed_tokens,
+            min_concurrent_requests=self.min_concurrent_requests,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

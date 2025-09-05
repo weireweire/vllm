@@ -245,6 +245,13 @@ class ParallelConfig:
         return aggregated_has_unfinished
 
     @staticmethod
+    def all_has_prefill_request(dp_group: ProcessGroup,
+                                prefill_num: int) -> bool:
+        tensor = torch.tensor([prefill_num], dtype=torch.int32, device="cpu")
+        torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
+        return tensor.item()
+
+    @staticmethod
     def sync_kv_cache_memory_size(dp_group: ProcessGroup,
                                   kv_cache_memory: int) -> int:
         if kv_cache_memory == -1:

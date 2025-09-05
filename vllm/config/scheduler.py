@@ -172,6 +172,12 @@ class SchedulerConfig:
     max_delayed_iterations. 
     """
 
+    min_concurrent_requests: int = 0
+    """The minimum number of requests that must be in the queued queue
+    in each rank. Make data parallel ranks wait for each other to avoid
+    inbalance. See also max_delayed_iterations, max_num_delayed_tokens. 
+    """
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

@@ -122,8 +122,8 @@ class DeviceCommunicatorBase:
             use_ep = config.parallel_config.data_parallel_size > 1
             all2all_backend = config.parallel_config.all2all_backend
 
-        self.is_ep_communicator = "ep" in unique_name
-        self.use_all2all = self.is_ep_communicator and use_ep
+        self.init_moe_modular = "ep" in unique_name or "pp" in unique_name
+        self.use_all2all = "ep" in unique_name and use_ep
         self.all2all_backend = all2all_backend
         self.all2all_manager: All2AllManagerBase | None = None
 
@@ -259,7 +259,7 @@ class DeviceCommunicatorBase:
         """
         Prepare the communication buffer for the model.
         """
-        if not self.is_ep_communicator:
+        if not self.init_moe_modular:
             return
 
         moe_modules = [
